@@ -1,7 +1,8 @@
-# Smart Port Scanner - Documentation
+# AllePorts - Advanced Smart Port Scanner
 
 ## Overview
-A comprehensive, Python-based Nmap wrapper designed for reliability, stealth, and detailed analysis. It features "Smart Retry" logic to unmask firewalled ports and a "Matrix" themed UI.
+AllePorts is a comprehensive, Python-based Nmap wrapper designed for reliability, stealth, and detailed analysis. It features "Smart Retry" logic to unmask firewalled ports and a "Matrix" themed UI.
+Development powered by Antigravity.
 
 ## Features
 -   **Three Scanning Modes**:
@@ -23,22 +24,22 @@ A comprehensive, Python-based Nmap wrapper designed for reliability, stealth, an
 ### 2. Running a Scan
 **Basic Usage (Default Mode):**
 ```bash
-sudo ./scanner.py <target_ip>
+sudo ./alleports <target_ip>
 ```
 
 **Fast Mode (Quick check):**
 ```bash
-sudo ./scanner.py <target_ip> --mode fast
+sudo ./alleports <target_ip> --mode fast
 ```
 
 **Slow Mode (Full exhaustive):**
 ```bash
-sudo ./scanner.py <target_ip> --mode slow
+sudo ./alleports <target_ip> --mode slow
 ```
 
 **Disable UDP (Faster):**
 ```bash
-sudo ./scanner.py <target_ip> --no-udp
+sudo ./alleports <target_ip> --no-udp
 ```
 
 ### 3. Understanding Results
