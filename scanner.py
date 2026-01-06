@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Smart Port Scanner - Developed with Antigravity
 import argparse
 import subprocess
 import sys
@@ -40,7 +39,7 @@ class SmartScanner:
         else:
             self._scan_default()
 
-        # Smart Retry Logic for filtered ports
+        
         # Identify ports that are currently filtered
         filtered = [p for k, p in self.results.items() if p['state'] in ['filtered', 'open|filtered']]
         
@@ -100,7 +99,7 @@ class SmartScanner:
         flags_str = " ".join(args)
         full_desc = f"{description} [dim green]({flags_str})[/dim green]"
         
-        # Setup Rich Progress Bar (Matrix Style)
+        # tasarım
         with Progress(
             SpinnerColumn(style="bold green"),
             TextColumn("[bold green]{task.description}"),
@@ -294,7 +293,7 @@ class SmartScanner:
 
     def _print_report(self):
         console.print("\n")
-        # Matrix Style: No header borders, minimal lines, Green text.
+        # tasarım: No header borders, minimal lines, Green text.
         table = Table(
             title=f"Target: {self.target}", 
             show_header=True, 
