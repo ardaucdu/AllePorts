@@ -19,10 +19,11 @@ warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 console = Console()
 
 class AllePorts:
-    def __init__(self, target, mode="default", no_udp=False):
+    def __init__(self, target, mode="default", no_udp=False, deep=False):
         self.target = target
         self.mode = mode
         self.no_udp = no_udp
+        self.deep = deep
         self.results = {} # Key: (port, protocol), Value: port_info dict
         self.nmap_path = shutil.which("nmap")
         
@@ -32,6 +33,9 @@ class AllePorts:
             
         if os.geteuid() != 0:
             console.print("[bold yellow]Warning:[/bold yellow] You are not running as root. Some scans (like SYN scan or UDP scan) may fail or fall back to connect scan.")
+        
+        if self.deep:
+            console.print("[bold cyan]Deep Mode Enabled:[/bold cyan] Maximum service detection accuracy (slower but more thorough)")
 
     def scan(self):
         console.print(f"[bold blue]AllePorts: Starting scan on {self.target} in {self.mode} mode...[/bold blue]")
@@ -530,7 +534,11 @@ class AllePorts:
         # Fast: Top 100 TCP & UDP
         # Command: nmap -F -sS -sU -sV <target>
         
-        flags = ["-F", "-sV"]
+        if self.deep:
+            flags = ["-F", "-sV", "--version-intensity", "9", "-sC"]
+        else:
+            flags = ["-F", "-sV", "--version-intensity", "8"]
+        
         desc = "Fast Scan"
         
         # Check permissions and user preference for UDP
@@ -554,7 +562,12 @@ class AllePorts:
         
         # 1. TCP All
         console.print("[bold green]Step 1/2: Scanning all TCP ports...[/bold green]")
-        tcp_flags = ["-p-", "-sV", "-T4"]
+        
+        if self.deep:
+            tcp_flags = ["-p-", "-sV", "--version-intensity", "9", "-sC", "-T4"]
+        else:
+            tcp_flags = ["-p-", "-sV", "--version-intensity", "8", "-T4"]
+        
         if os.geteuid() == 0:
             tcp_flags.append("-sS")
         else:
@@ -567,7 +580,10 @@ class AllePorts:
         
         if use_udp:
             console.print("[bold green]Step 2/2: Scanning top 20 UDP ports...[/bold green]")
-            self._run_nmap(["-sU", "--top-ports", "20", "-sV"], "UDP Top 20 Scan")
+            if self.deep:
+                self._run_nmap(["-sU", "--top-ports", "20", "-sV", "--version-intensity", "9"], "UDP Top 20 Scan")
+            else:
+                self._run_nmap(["-sU", "--top-ports", "20", "-sV", "--version-intensity", "8"], "UDP Top 20 Scan")
         else:
              if self.no_udp:
                 console.print("[dim green]Skipping UDP scan (--no-udp specified)[/dim green]")
@@ -579,7 +595,12 @@ class AllePorts:
         
         # 1. TCP All
         console.print("[bold green]Step 1/2: Scanning all TCP ports...[/bold green]")
-        tcp_flags = ["-p-", "-sV", "-T4"]
+        
+        if self.deep:
+            tcp_flags = ["-p-", "-sV", "--version-intensity", "9", "-sC", "-T4"]
+        else:
+            tcp_flags = ["-p-", "-sV", "--version-intensity", "8", "-T4"]
+        
         if os.geteuid() == 0:
             tcp_flags.append("-sS")
         else:
@@ -592,7 +613,10 @@ class AllePorts:
         
         if use_udp:
             console.print("[bold green]Step 2/2: Scanning all UDP ports (This will take a long time)...[/bold green]")
-            self._run_nmap(["-sU", "-p-", "-sV", "-T4"], "UDP All-Port Scan")
+            if self.deep:
+                self._run_nmap(["-sU", "-p-", "-sV", "--version-intensity", "9", "-T4"], "UDP All-Port Scan")
+            else:
+                self._run_nmap(["-sU", "-p-", "-sV", "--version-intensity", "8", "-T4"], "UDP All-Port Scan")
         else:
             if self.no_udp:
                 console.print("[dim green]Skipping UDP scan (--no-udp specified)[/dim green]")
@@ -674,12 +698,13 @@ def main():
     parser.add_argument("target", help="Target IP or hostname")
     parser.add_argument("--mode", choices=["fast", "default", "slow"], default="default", help="Scan mode")
     parser.add_argument("--no-udp", action="store_true", help="Disable UDP scanning completely")
+    parser.add_argument("--deep", action="store_true", help="Enable deep service detection (version intensity 9 + NSE scripts)")
     
     # Allow passing through nmap args? For now, keep it simple as per request.
     
     args = parser.parse_args()
 
-    scanner = AllePorts(args.target, args.mode, args.no_udp)
+    scanner = AllePorts(args.target, args.mode, args.no_udp, args.deep)
     scanner.scan()
 
 if __name__ == "__main__":
