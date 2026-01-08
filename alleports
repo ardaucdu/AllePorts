@@ -19,11 +19,13 @@ warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 console = Console()
 
 class AllePorts:
-    def __init__(self, target, mode="default", no_udp=False, deep=False):
+    def __init__(self, target, mode="default", no_udp=False, deep=False, verify=False, verbose=False):
         self.target = target
         self.mode = mode
         self.no_udp = no_udp
         self.deep = deep
+        self.verify = verify
+        self.verbose = verbose
         self.results = {} # Key: (port, protocol), Value: port_info dict
         self.nmap_path = shutil.which("nmap")
         
@@ -36,9 +38,18 @@ class AllePorts:
         
         if self.deep:
             console.print("[bold cyan]Deep Mode Enabled:[/bold cyan] Maximum service detection accuracy (slower but more thorough)")
+        
+        if self.verify:
+            console.print("[bold cyan]Verification Enabled:[/bold cyan] Open ports will be double-checked for accuracy")
+        
+        if self.verbose:
+            console.print("[bold cyan]Verbose Mode:[/bold cyan] Detailed operation logging enabled\n")
 
     def scan(self):
-        console.print(f"[bold blue]AllePorts: Starting scan on {self.target} in {self.mode} mode...[/bold blue]")
+        console.print(f"[bold blue]AllePorts: Starting scan on {self.target} in {self.mode} mode...[/bold blue]\n")
+        
+        if self.verbose:
+            console.print("[dim green]→ Phase 1: Initial port discovery[/dim green]")
         
         if self.mode == "fast":
             self._scan_fast()
@@ -46,16 +57,84 @@ class AllePorts:
             self._scan_slow()
         else:
             self._scan_default()
+        
+        if self.verbose:
+            open_count = len([p for p in self.results.values() if p['state'] == 'open'])
+            console.print(f"[bold green]✓ Initial scan complete: {open_count} open port(s) found[/bold green]\n")
 
         # Smart Retry Logic for filtered ports
         # Identify ports that are currently filtered
         filtered = [p for k, p in self.results.items() if p['state'] in ['filtered', 'open|filtered']]
         
         if filtered:
-             self._retry_smart_exhaustive(filtered)
+            if self.verbose:
+                console.print(f"[dim green]→ Phase 2: Smart retry on {len(filtered)} filtered port(s)[/dim green]")
+            self._retry_smart_exhaustive(filtered)
+            if self.verbose:
+                console.print(f"[bold green]✓ Smart retry complete[/bold green]\n")
+        
+        # Port Verification
+        if self.verify:
+            if self.verbose:
+                console.print("[dim green]→ Phase 3: Port verification[/dim green]")
+            self._verify_open_ports()
+            if self.verbose:
+                console.print(f"[bold green]✓ Verification complete[/bold green]\n")
         
         self._print_report()
 
+    def _vlog(self, message):
+        """Verbose logging helper"""
+        if self.verbose:
+            console.print(f"[dim]  {message}[/dim]")
+    
+    def _get_reliability_flags(self):
+        """Returns flags for maximum reliability when verify is enabled"""
+        if self.verify:
+            return ["--max-retries", "2", "--min-rtt-timeout", "100ms", "--max-rtt-timeout", "500ms"]
+        return []
+    
+    def _verify_open_ports(self):
+        """Root-optimized: Verify open ports with dual scan (SYN + Connect)"""
+        open_ports = [p for p in self.results.values() if p['state'] == 'open']
+        
+        if not open_ports:
+            self._vlog("No open ports to verify")
+            return
+        
+        port_list = [p['port'] for p in open_ports]
+        port_arg = ",".join(port_list)
+        
+        console.print(f"\n[bold cyan]Verifying {len(open_ports)} open port(s) with TCP Connect...[/bold cyan]")
+        self._vlog(f"Running TCP Connect scan on ports: {port_arg}")
+        
+        # Store current states
+        pre_verify = {(p['port'], p['protocol']): p['state'] for p in open_ports}
+        
+        # TCP Connect scan for verification (different method = cross-validation)
+        self._run_nmap(["-sT", "-p", port_arg, "-Pn", "--max-retries", "2"], 
+                       "Port Verification (TCP Connect)")
+        
+        # Check for discrepancies
+        verified = []
+        suspicious = []
+        
+        for port_info in open_ports:
+            key = (port_info['port'], port_info['protocol'])
+            current_state = self.results.get(key, {}).get('state', 'unknown')
+            
+            if current_state == 'open':
+                verified.append(port_info['port'])
+                self._vlog(f"Port {port_info['port']} verified as open")
+            else:
+                suspicious.append(port_info['port'])
+                console.print(f"[yellow]⚠ Port {port_info['port']} verification failed (SYN: open, Connect: {current_state})[/yellow]")
+        
+        if verified:
+            console.print(f"[bold green]✓ Verified {len(verified)}/{len(open_ports)} port(s) as genuinely open[/bold green]")
+        if suspicious:
+            console.print(f"[bold yellow]⚠ {len(suspicious)} port(s) marked as suspicious (possible false positives)[/bold yellow]")
+    
     def _detect_firewall(self):
         """Detect firewall presence and type using ACK scan."""
         console.print("\n[dim]Analyzing firewall configuration...[/dim]")
@@ -331,12 +410,18 @@ class AllePorts:
         """Exhaustive but optimized retry - zero port loss guarantee."""
         
         # Step 1: Firewall profiling
+        self._vlog("Step 1: Analyzing firewall configuration...")
         fw_profile = self._detect_firewall()
+        if self.verbose:
+            console.print(f"[bold green]✓ Firewall analysis complete[/bold green]")
         
         # Step 2: OS Detection
+        self._vlog("Step 2: Detecting target operating system...")
         os_type, confidence = self._detect_os_intelligent(fw_profile)
+        if self.verbose:
+            console.print(f"[bold green]✓ OS detection complete[/bold green]\n")
         
-        console.print(f"\n[bold green]Smart Retry Strategy:[/bold green]")
+        console.print(f"[bold green]Smart Retry Strategy:[/bold green]")
         console.print(f"  Target OS: [cyan]{os_type}[/cyan] (confidence: {confidence}%)")
         console.print(f"  Firewall: [yellow]{fw_profile['type']}[/yellow] ({fw_profile['filtering']} filtering)")
         console.print(f"  Initial filtered ports: [red]{len(filtered_ports)}[/red]\n")
@@ -417,7 +502,6 @@ class AllePorts:
             TextColumn("[bold green]{task.description}"),
             BarColumn(bar_width=None, style="green", complete_style="bold green", finished_style="bold green"),
             TextColumn("[bold green]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
             console=console,
             transient=True 
         ) as progress:
@@ -495,12 +579,29 @@ class AllePorts:
                         
                         service_elem = port_elem.find("service")
                         service = service_elem.get("name") if service_elem is not None else "unknown"
+                    
+                        # Extract version information
+                        version_parts = []
+                        if service_elem is not None:
+                            product = service_elem.get("product")
+                            version = service_elem.get("version")
+                            extrainfo = service_elem.get("extrainfo")
+                            
+                            if product:
+                                version_parts.append(product)
+                            if version:
+                                version_parts.append(version)
+                            if extrainfo:
+                                version_parts.append(f"({extrainfo})")
+                        
+                        version_str = " ".join(version_parts) if version_parts else ""
                         
                         port_info = {
                             "port": port_id, 
                             "protocol": protocol, 
                             "state": state, 
                             "service": service,
+                            "version": version_str,
                             "reason": reason
                         }
                         
@@ -534,10 +635,15 @@ class AllePorts:
         # Fast: Top 100 TCP & UDP
         # Command: nmap -F -sS -sU -sV <target>
         
+        self._vlog("Preparing fast scan (top 100 ports)...")
+        
         if self.deep:
             flags = ["-F", "-sV", "--version-intensity", "9", "-sC"]
         else:
             flags = ["-F", "-sV", "--version-intensity", "8"]
+        
+        # Add reliability flags if verify enabled
+        flags.extend(self._get_reliability_flags())
         
         desc = "Fast Scan"
         
@@ -562,11 +668,15 @@ class AllePorts:
         
         # 1. TCP All
         console.print("[bold green]Step 1/2: Scanning all TCP ports...[/bold green]")
+        self._vlog("Initiating full TCP port range scan (1-65535)...")
         
         if self.deep:
             tcp_flags = ["-p-", "-sV", "--version-intensity", "9", "-sC", "-T4"]
         else:
             tcp_flags = ["-p-", "-sV", "--version-intensity", "8", "-T4"]
+        
+        # Add reliability flags if verify enabled
+        tcp_flags.extend(self._get_reliability_flags())
         
         if os.geteuid() == 0:
             tcp_flags.append("-sS")
@@ -595,11 +705,15 @@ class AllePorts:
         
         # 1. TCP All
         console.print("[bold green]Step 1/2: Scanning all TCP ports...[/bold green]")
+        self._vlog("Initiating comprehensive TCP scan (all 65535 ports)...")
         
         if self.deep:
             tcp_flags = ["-p-", "-sV", "--version-intensity", "9", "-sC", "-T4"]
         else:
             tcp_flags = ["-p-", "-sV", "--version-intensity", "8", "-T4"]
+        
+        # Add reliability flags if verify enabled
+        tcp_flags.extend(self._get_reliability_flags())
         
         if os.geteuid() == 0:
             tcp_flags.append("-sS")
@@ -638,7 +752,7 @@ class AllePorts:
         table.add_column("PROTO", style="green")
         table.add_column("STATE", justify="center")
         table.add_column("SERVICE", style="green")
-        table.add_column("VERSION/REASON", style="dim green")
+        table.add_column("VERSION", style="dim green")
 
         # Sort by port number
         sorted_ports = sorted(self.results.values(), key=lambda x: int(x['port']))
@@ -660,7 +774,7 @@ class AllePorts:
             else:
                 state_fmt = f"[green]{state}[/green]"
 
-            table.add_row(p['port'], p['protocol'], state_fmt, p['service'], p.get('reason', ''))
+            table.add_row(p['port'], p['protocol'], state_fmt, p['service'], p.get('version', ''))
 
         console.print(table)
         
@@ -699,12 +813,14 @@ def main():
     parser.add_argument("--mode", choices=["fast", "default", "slow"], default="default", help="Scan mode")
     parser.add_argument("--no-udp", action="store_true", help="Disable UDP scanning completely")
     parser.add_argument("--deep", action="store_true", help="Enable deep service detection (version intensity 9 + NSE scripts)")
+    parser.add_argument("--verify", action="store_true", help="Verify open ports with dual-scan for maximum accuracy")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output with detailed progress")
     
     # Allow passing through nmap args? For now, keep it simple as per request.
     
     args = parser.parse_args()
 
-    scanner = AllePorts(args.target, args.mode, args.no_udp, args.deep)
+    scanner = AllePorts(args.target, args.mode, args.no_udp, args.deep, args.verify, args.verbose)
     scanner.scan()
 
 if __name__ == "__main__":
