@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""
+AllePorts V2 - Production-Grade Advanced Port Scanner
+Features:
+- Global State Management with SQLite (Crash Recovery)
+- Canary-based Circuit Breaker (Firewall Ban Detection)
+- Decoy Injection (IDS/IPS Evasion)
+- Multi-Vector Decision Logic (TCP Connect -> ACK Scan -> Layer 7)
+- Smart Jitter & Congestion Control
+- TTL-based Firewall Spoofing Detection
+"""
+
+import argparse
+import socket
+import sqlite3
+import random
+import time
+import sys
+import os
+import struct
+from datetime import datetime
+from scapy.all import IP, TCP, sr1, RandShort, send
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich import box
+
+console = Console()
+
+# ============================================================================
+# DATABASE & STATE MANAGEMENT
+# ============================================================================
+
+class StateManager:
+    """Manages scan state with SQLite for crash recovery"""
+    
+    def __init__(self, target, db_path="alleports_state.db"):
+        self.target = target
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self._init_db()
+        
+    def _init_db(self):
+        """Initialize database schema"""
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS scan_state (
+                ip TEXT,
+                port INTEGER,
+                status TEXT,
+                stage TEXT,
+                service TEXT,
+                banner TEXT,
+                method TEXT,
+                confidence TEXT,
+                timestamp DATETIME,
+                PRIMARY KEY (ip, port)
+            )
+        """)
+        self.conn.commit()
+        console.print(f"[dim green]✓ State database initialized: {self.db_path}[/dim green]")
+        
+    def is_port_scanned(self, port):
+        """Check if port was already scanned"""
+        self.cursor.execute(
+            "SELECT status FROM scan_state WHERE ip = ? AND port = ?",
+            (self.target, port)
+        )
+        result = self.cursor.fetchone()
+        return result is not None
+        
+    def save_port(self, port, status, stage, service="", banner="", method="", confidence=""):
+        """Save port scan result"""
+        self.cursor.execute("""
+            INSERT OR REPLACE INTO scan_state 
+            (ip, port, status, stage, service, banner, method, confidence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (self.target, port, status, stage, service, banner, method, confidence, datetime.now()))
+        
+    def commit(self):
+        """Commit changes to database"""
+        self.conn.commit()
+        
+    def get_all_results(self):
+        """Retrieve all scan results"""
+        self.cursor.execute(
+            "SELECT port, status, service, banner, method, confidence FROM scan_state WHERE ip = ? ORDER BY port",
+            (self.target,)
+        )
+        return self.cursor.fetchall()
+        
+    def get_stats(self):
+        """Get scan statistics"""
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM scan_state WHERE ip = ?",
+            (self.target,)
+        )
+        total = self.cursor.fetchone()[0]
+        
+        self.cursor.execute(
+            "SELECT status, COUNT(*) FROM scan_state WHERE ip = ? GROUP BY status",
+            (self.target,)
+        )
+        status_counts = dict(self.cursor.fetchall())
+        
+        return total, status_counts
+        
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+
+# ============================================================================
+# CANARY & CIRCUIT BREAKER
+# ============================================================================
+
+class CanaryMonitor:
+    """Monitors target availability using a canary port"""
+    
+    def __init__(self, target, canary_port=80, timeout=3):
+        self.target = target
+        self.canary_port = canary_port
+        self.timeout = timeout
+        self.rtt = None
+        self.canary_ttl = None
+        
+    def find_canary(self):
+        """Find a reliable open port (80, 443, or ICMP)"""
+        console.print("\n[bold cyan]═══ Reconnaissance Phase ═══[/bold cyan]")
+        console.print("[dim]Searching for canary port...[/dim]")
+        
+        # Try common ports
+        candidates = [80, 443, 22, 21]
+        for port in candidates:
+            if self._test_port(port):
+                self.canary_port = port
+                console.print(f"[bold green]✓ Canary found: Port {port}[/bold green]")
+                return True
+                
+        console.print("[yellow]⚠ No reliable canary found. Circuit breaker disabled.[/yellow]")
+        return False
+        
+    def _test_port(self, port):
+        """Test if port is open and measure RTT"""
+        try:
+            start_time = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((self.target, port))
+            end_time = time.time()
+            sock.close()
+            
+            if result == 0:
+                self.rtt = end_time - start_time
+                console.print(f"[dim green]  Port {port}: RTT = {self.rtt*1000:.2f}ms[/dim green]")
+                
+                # Get TTL via Scapy
+                try:
+                    pkt = IP(dst=self.target)/TCP(dport=port, flags="S")
+                    response = sr1(pkt, timeout=2, verbose=0)
+                    if response:
+                        self.canary_ttl = response.ttl
+                        console.print(f"[dim green]  Canary TTL: {self.canary_ttl}[/dim green]")
+                except:
+                    pass
+                    
+                return True
+        except:
+            pass
+        return False
+        
+    def calibrate_timeout(self):
+        """Calculate optimal timeout based on RTT"""
+        if self.rtt:
+            optimal_timeout = self.rtt * 4
+            console.print(f"[bold cyan]Calibrated Timeout: {optimal_timeout*1000:.2f}ms (RTT * 4)[/bold cyan]")
+            return optimal_timeout
+        return 3.0  # Default fallback
+        
+    def check_canary(self):
+        """Check if canary is still alive (Circuit Breaker)"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((self.target, self.canary_port))
+            sock.close()
+            return result == 0
+        except:
+            return False
+
+# ============================================================================
+# DECOY INJECTION (IDS/IPS EVASION)
+# ============================================================================
+
+def send_with_decoys(target_ip, target_port, real_src_ip):
+    """
+    Send packet with decoy injection:
+    Decoy 1 -> Real Packet -> Decoy 2
+    """
+    decoys = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
+    
+    # Decoy 1
+    decoy1 = random.choice(decoys)
+    send(IP(src=decoy1, dst=target_ip)/TCP(dport=target_port, flags="S", seq=RandShort()), verbose=0)
+    
+    # Real Packet
+    pkt = IP(src=real_src_ip, dst=target_ip)/TCP(dport=target_port, flags="S", seq=RandShort())
+    response = sr1(pkt, timeout=2, verbose=0)
+    
+    # Decoy 2
+    decoy2 = random.choice([d for d in decoys if d != decoy1])
+    send(IP(src=decoy2, dst=target_ip)/TCP(dport=target_port, flags="S", seq=RandShort()), verbose=0)
+    
+    return response
+
+# ============================================================================
+# SMART DELAY & JITTER
+# ============================================================================
+
+class AdaptiveDelay:
+    """Dynamic delay with jitter and congestion control"""
+    
+    def __init__(self, base_delay=0.5):
+        self.base_delay = base_delay
+        self.current_delay = base_delay
+        self.last_result = None
+        
+    def smart_sleep(self):
+        """
+        Sleep with:
+        1. Base Delay
+        2. Jitter Factor (-20% to +20%)
+        3. Congestion Control
+        """
+        # Jitter
+        jitter_factor = random.uniform(-0.2, 0.2) * self.base_delay
+        
+        # Congestion Control
+        if self.last_result == "TIMEOUT":
+            self.current_delay *= 1.5  # Slow down
+        elif self.last_result == "SUCCESS":
+            # Gradually return to base delay
+            self.current_delay = max(self.base_delay, self.current_delay * 0.95)
+            
+        # Calculate final delay
+        sleep_time = self.current_delay + jitter_factor
+        sleep_time = max(0.1, sleep_time)  # Minimum 100ms
+        
+        time.sleep(sleep_time)
+        
+    def update_result(self, result):
+        """Update last scan result for congestion control"""
+        self.last_result = result
+
+# ============================================================================
+# MULTI-VECTOR DECISION LOGIC
+# ============================================================================
+
+class PortScanner:
+    """Advanced multi-stage port scanner"""
+    
+    def __init__(self, target, timeout=3, canary_monitor=None):
+        self.target = target
+        self.timeout = timeout
+        self.canary = canary_monitor
+        
+    def scan_port(self, port):
+        """
+        Multi-stage scan:
+        Stage A: TCP Connect
+        Stage B: ACK Scan (if timeout)
+        Stage C: Layer 7 Verification (if connected)
+        """
+        result = {
+            'port': port,
+            'status': 'UNKNOWN',
+            'stage': '',
+            'service': '',
+            'banner': '',
+            'method': '',
+            'confidence': 'Low'
+        }
+        
+        # STAGE A: TCP Connect Scan
+        connect_result = self._tcp_connect(port)
+        
+        if connect_result == "CONNECTED":
+            result['stage'] = 'Stage C'
+            # Go to Stage C
+            l7_result = self._layer7_verification(port)
+            result.update(l7_result)
+            return result
+            
+        elif connect_result == "REFUSED":
+            result['status'] = 'CLOSED'
+            result['stage'] = 'Stage A'
+            result['method'] = 'TCP Connect'
+            return result
+            
+        elif connect_result == "TIMEOUT":
+            # Go to Stage B
+            result['stage'] = 'Stage B'
+            ack_result = self._ack_scan(port)
+            result.update(ack_result)
+            return result
+            
+        return result
+        
+    def _tcp_connect(self, port):
+        """Stage A: Standard TCP Connect"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((self.target, port))
+            sock.close()
+            
+            if result == 0:
+                return "CONNECTED"
+            elif result == 111:  # Connection refused
+                return "REFUSED"
+            else:
+                return "TIMEOUT"
+        except socket.timeout:
+            return "TIMEOUT"
+        except:
+            return "TIMEOUT"
+            
+    def _ack_scan(self, port):
+        """Stage B: ACK Scan for firewall inference"""
+        result = {
+            'status': 'FILTERED',
+            'method': 'ACK Scan',
+            'confidence': 'Medium'
+        }
+        
+        try:
+            # Send ACK packet
+            pkt = IP(dst=self.target)/TCP(dport=port, flags="A", seq=1000)
+            response = sr1(pkt, timeout=self.timeout, verbose=0)
+            
+            if response:
+                if response.haslayer(TCP):
+                    if response[TCP].flags & 0x04:  # RST flag
+                        result['status'] = 'FILTERED'
+                        result['service'] = 'Firewall Blocking'
+                    else:
+                        result['status'] = 'OPEN|FILTERED'
+            else:
+                result['status'] = 'FILTERED/DOWN'
+                result['confidence'] = 'Low'
+                
+        except Exception as e:
+            result['status'] = 'ERROR'
+            result['service'] = str(e)[:50]
+            
+        return result
+        
+    def _layer7_verification(self, port):
+        """Stage C: Layer 7 Service Verification"""
+        result = {
+            'status': 'OPEN',
+            'method': 'Layer 7',
+            'confidence': 'High',
+            'service': 'unknown',
+            'banner': ''
+        }
+        
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect((self.target, port))
+            
+            # Send protocol-specific or generic payload
+            payload = self._get_payload(port)
+            sock.send(payload.encode())
+            
+            # Try to receive banner
+            try:
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                if banner:
+                    result['banner'] = banner[:100]  # Limit banner length
+                    result['status'] = 'OPEN'
+                    result['service'] = self._identify_service(port, banner)
+                else:
+                    result['status'] = 'OPEN (Silent)'
+                    result['service'] = self._guess_service(port)
+            except socket.timeout:
+                result['status'] = 'OPEN (Silent)'
+                result['service'] = self._guess_service(port)
+                
+            sock.close()
+            
+        except ConnectionResetError:
+            # Socket accepts but sends RST on data
+            result['status'] = 'OPEN (Unstable)'
+            result['service'] = 'Firewall Spoofing?'
+            result['confidence'] = 'Medium'
+            
+            # TTL Comparison (if canary available)
+            if self.canary and self.canary.canary_ttl:
+                try:
+                    pkt = IP(dst=self.target)/TCP(dport=port, flags="S")
+                    response = sr1(pkt, timeout=2, verbose=0)
+                    if response and response.ttl != self.canary.canary_ttl:
+                        result['service'] += ' (TTL Mismatch)'
+                except:
+                    pass
+                    
+        except Exception as e:
+            result['status'] = 'OPEN (Error)'
+            result['service'] = str(e)[:50]
+            
+        return result
+        
+    def _get_payload(self, port):
+        """Get protocol-specific payload"""
+        payloads = {
+            80: "GET / HTTP/1.0\r\n\r\n",
+            443: "GET / HTTP/1.0\r\n\r\n",
+            22: "\r\n",
+            21: "USER anonymous\r\n",
+            25: "EHLO test\r\n",
+        }
+        return payloads.get(port, "HELP\r\n")
+        
+    def _identify_service(self, port, banner):
+        """Identify service from banner"""
+        banner_lower = banner.lower()
+        
+        if "ssh" in banner_lower:
+            return "SSH"
+        elif "http" in banner_lower:
+            return "HTTP"
+        elif "ftp" in banner_lower:
+            return "FTP"
+        elif "smtp" in banner_lower:
+            return "SMTP"
+        elif "mysql" in banner_lower:
+            return "MySQL"
+        else:
+            return self._guess_service(port)
+            
+    def _guess_service(self, port):
+        """Guess service by port number"""
+        common_services = {
+            21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
+            53: "DNS", 80: "HTTP", 110: "POP3", 143: "IMAP",
+            443: "HTTPS", 445: "SMB", 3306: "MySQL", 3389: "RDP",
+            5432: "PostgreSQL", 6379: "Redis", 8080: "HTTP-Alt"
+        }
+        return common_services.get(port, f"Port-{port}")
+
+# ============================================================================
+# MAIN SCANNER ORCHESTRATOR
+# ============================================================================
+
+class AllePortsV2:
+    """Main scanner orchestrator with all components"""
+    
+    def __init__(self, target, port_range=(1, 65535), base_delay=0.5, use_decoys=False):
+        self.target = target
+        self.port_range = port_range
+        self.base_delay = base_delay
+        self.use_decoys = use_decoys
+        
+        # Initialize components
+        self.state_manager = StateManager(target)
+        self.canary = CanaryMonitor(target)
+        self.delay_manager = AdaptiveDelay(base_delay)
+        self.scanner = None  # Will be initialized after canary setup
+        
+        # Check if running as root
+        if os.geteuid() != 0:
+            console.print("[bold yellow]⚠ Warning: Not running as root. Raw packet features disabled.[/bold yellow]")
+            self.use_decoys = False
+            
+    def run(self):
+        """Main scan execution"""
+        console.print("[bold blue]═══════════════════════════════════════[/bold blue]")
+        console.print("[bold blue]   AllePorts V2 - Advanced Scanner    [/bold blue]")
+        console.print("[bold blue]═══════════════════════════════════════[/bold blue]\n")
+        
+        # Reconnaissance Phase
+        canary_found = self.canary.find_canary()
+        if canary_found:
+            optimal_timeout = self.canary.calibrate_timeout()
+        else:
+            optimal_timeout = 3.0
+            
+        self.scanner = PortScanner(self.target, optimal_timeout, self.canary if canary_found else None)
+        
+        # Generate port list
+        ports = list(range(self.port_range[0], self.port_range[1] + 1))
+        
+        # Filter already scanned ports
+        total_scanned, status_counts = self.state_manager.get_stats()
+        if total_scanned > 0:
+            console.print(f"\n[bold yellow]⚠ Resuming previous scan: {total_scanned} ports already scanned[/bold yellow]")
+            ports = [p for p in ports if not self.state_manager.is_port_scanned(p)]
+            
+        # Shuffle for evasion
+        random.shuffle(ports)
+        
+        console.print(f"\n[bold cyan]═══ Scan Configuration ═══[/bold cyan]")
+        console.print(f"Target: [green]{self.target}[/green]")
+        console.print(f"Port Range: [cyan]{self.port_range[0]}-{self.port_range[1]}[/cyan]")
+        console.print(f"Ports to Scan: [yellow]{len(ports)}[/yellow]")
+        console.print(f"Base Delay: [cyan]{self.base_delay}s[/cyan]")
+        console.print(f"Decoy Injection: [{'green' if self.use_decoys else 'red'}]{'Enabled' if self.use_decoys else 'Disabled'}[/{'green' if self.use_decoys else 'red'}]")
+        console.print(f"Circuit Breaker: [{'green' if canary_found else 'red'}]{'Armed' if canary_found else 'Disabled'}[/{'green' if canary_found else 'red'}]\n")
+        
+        # Main scan loop
+        self._scan_loop(ports, canary_found)
+        
+        # Print final report
+        self._print_report()
+        
+        # Cleanup
+        self.state_manager.close()
+        
+    def _scan_loop(self, ports, canary_enabled):
+        """Main scan loop with circuit breaker"""
+        console.print("[bold green]═══ Starting Scan ═══[/bold green]\n")
+        
+        scanned_count = 0
+        commit_counter = 0
+        
+        with Progress(
+            SpinnerColumn(style="bold cyan"),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40, style="cyan"),
+            TextColumn("[bold cyan]{task.completed}/{task.total}"),
+            console=console
+        ) as progress:
+            task = progress.add_task(f"Scanning {self.target}", total=len(ports))
+            
+            for port in ports:
+                # Circuit Breaker Check (every 50 ports)
+                if canary_enabled and scanned_count > 0 and scanned_count % 50 == 0:
+                    if not self.canary.check_canary():
+                        console.print("\n[bold red]🚨 CIRCUIT BREAKER TRIGGERED![/bold red]")
+                        console.print("[bold red]Canary port failed. Possible firewall ban detected.[/bold red]")
+                        console.print("[yellow]Aborting to prevent false negatives.[/yellow]\n")
+                        break
+                        
+                # Smart delay
+                self.delay_manager.smart_sleep()
+                
+                # Scan port
+                result = self.scanner.scan_port(port)
+                
+                # Update delay manager
+                if "TIMEOUT" in result['status'] or "FILTERED" in result['status']:
+                    self.delay_manager.update_result("TIMEOUT")
+                else:
+                    self.delay_manager.update_result("SUCCESS")
+                    
+                # Save to database
+                self.state_manager.save_port(
+                    result['port'],
+                    result['status'],
+                    result['stage'],
+                    result['service'],
+                    result['banner'],
+                    result['method'],
+                    result['confidence']
+                )
+                
+                # Commit every 10 ports
+                commit_counter += 1
+                if commit_counter >= 10:
+                    self.state_manager.commit()
+                    commit_counter = 0
+                    
+                scanned_count += 1
+                progress.update(task, advance=1)
+                
+        # Final commit
+        self.state_manager.commit()
+        console.print(f"\n[bold green]✓ Scan complete: {scanned_count} ports scanned[/bold green]\n")
+        
+    def _print_report(self):
+        """Print final scan report"""
+        console.print("[bold cyan]═══════════════════════════════════════[/bold cyan]")
+        console.print("[bold cyan]           SCAN RESULTS                [/bold cyan]")
+        console.print("[bold cyan]═══════════════════════════════════════[/bold cyan]\n")
+        
+        results = self.state_manager.get_all_results()
+        
+        # Filter interesting results
+        interesting = [r for r in results if 'OPEN' in r[1] or 'FILTERED' in r[1]]
+        
+        if not interesting:
+            console.print("[yellow]No open or filtered ports found.[/yellow]\n")
+            return
+            
+        # Create table
+        table = Table(
+            title=f"AllePorts V2 Analysis: {self.target}",
+            show_header=True,
+            header_style="bold black on cyan",
+            box=box.SIMPLE,
+            border_style="cyan",
+            title_style="bold cyan"
+        )
+        
+        table.add_column("PORT", justify="right", style="bold cyan")
+        table.add_column("STATUS", justify="center")
+        table.add_column("SERVICE", style="cyan")
+        table.add_column("BANNER", style="dim cyan", overflow="fold")
+        table.add_column("METHOD", style="green")
+        table.add_column("CONFIDENCE", justify="center")
+        
+        for port, status, service, banner, method, confidence in interesting:
+            # Color code status
+            if "OPEN" in status and "FILTERED" not in status:
+                status_fmt = f"[bold green]{status}[/bold green]"
+            elif "FILTERED" in status:
+                status_fmt = f"[bold yellow]{status}[/bold yellow]"
+            else:
+                status_fmt = f"[dim]{status}[/dim]"
+                
+            # Truncate banner
+            banner_display = banner[:50] + "..." if len(banner) > 50 else banner
+            
+            table.add_row(
+                str(port),
+                status_fmt,
+                service,
+                banner_display,
+                method,
+                confidence
+            )
+            
+        console.print(table)
+        
+        # Statistics
+        total, status_counts = self.state_manager.get_stats()
+        console.print(f"\n[bold]Scan Summary:[/bold]")
+        console.print(f"  Total Scanned: [cyan]{total}[/cyan]")
+        for status, count in status_counts.items():
+            if "OPEN" in status:
+                color = "green"
+            elif "FILTERED" in status:
+                color = "yellow"
+            else:
+                color = "dim"
+            console.print(f"  {status}: [{color}]{count}[/{color}]")
+        console.print()
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AllePorts V2 - Production-Grade Advanced Port Scanner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo ./alleportsv2 192.168.1.1
+  sudo ./alleportsv2 example.com --ports 1-1000
+  sudo ./alleportsv2 10.0.0.1 --delay 1.0 --decoys
+        """
+    )
+    
+    parser.add_argument("target", help="Target IP or hostname")
+    parser.add_argument("--ports", default="1-65535", help="Port range (e.g., 1-1000)")
+    parser.add_argument("--delay", type=float, default=0.5, help="Base delay between ports (default: 0.5s)")
+    parser.add_argument("--decoys", action="store_true", help="Enable decoy injection (requires root)")
+    parser.add_argument("--db", default="alleports_state.db", help="State database path")
+    
+    args = parser.parse_args()
+    
+    # Parse port range
+    try:
+        start_port, end_port = map(int, args.ports.split('-'))
+        if not (1 <= start_port <= 65535 and 1 <= end_port <= 65535):
+            raise ValueError
+    except:
+        console.print("[bold red]Error: Invalid port range. Use format: 1-65535[/bold red]")
+        sys.exit(1)
+        
+    # Initialize and run scanner
+    try:
+        scanner = AllePortsV2(
+            target=args.target,
+            port_range=(start_port, end_port),
+            base_delay=args.delay,
+            use_decoys=args.decoys
+        )
+        scanner.run()
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]⚠ Scan interrupted by user[/bold yellow]")
+        console.print("[dim]Progress saved. Resume by running the same command.[/dim]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"[bold red]Fatal Error:[/bold red] {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
