@@ -28,6 +28,23 @@ from rich import box
 console = Console()
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_local_ip():
+    """Get local IP address for source IP in raw packets"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Connect to external IP to find outgoing interface
+        s.connect(('8.8.8.8', 1))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = '127.0.0.1'
+    finally:
+        s.close()
+    return local_ip
+
+# ============================================================================
 # DATABASE & STATE MANAGEMENT
 # ============================================================================
 
@@ -191,12 +208,13 @@ class CanaryMonitor:
 # DECOY INJECTION (IDS/IPS EVASION)
 # ============================================================================
 
-def send_with_decoys(target_ip, target_port, real_src_ip):
+def send_with_decoys(target_ip, target_port):
     """
     Send packet with decoy injection:
     Decoy 1 -> Real Packet -> Decoy 2
     """
     decoys = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
+    real_src_ip = get_local_ip()  # Auto-detect local IP
     
     # Decoy 1
     decoy1 = random.choice(decoys)
@@ -258,10 +276,11 @@ class AdaptiveDelay:
 class PortScanner:
     """Advanced multi-stage port scanner"""
     
-    def __init__(self, target, timeout=3, canary_monitor=None):
+    def __init__(self, target, timeout=3, canary_monitor=None, use_decoys=False):
         self.target = target
         self.timeout = timeout
         self.canary = canary_monitor
+        self.use_decoys = use_decoys
         
     def scan_port(self, port):
         """
@@ -306,7 +325,32 @@ class PortScanner:
         return result
         
     def _tcp_connect(self, port):
-        """Stage A: Standard TCP Connect"""
+        """Stage A: Standard TCP Connect OR Decoy SYN Scan"""
+        
+        # If decoys enabled, use Scapy SYN scan with decoy injection
+        if self.use_decoys:
+            try:
+                response = send_with_decoys(self.target, port)
+                
+                if not response:
+                    return "TIMEOUT"
+                
+                if response.haslayer(TCP):
+                    if response[TCP].flags & 0x12:  # SYN+ACK (0x12 = SYN+ACK)
+                        # Send RST to close connection gracefully
+                        send(IP(dst=self.target)/TCP(dport=port, flags="R", seq=response[TCP].ack), verbose=0)
+                        return "CONNECTED"
+                    elif response[TCP].flags & 0x04:  # RST (0x04 = RST)
+                        return "REFUSED"
+                    else:
+                        return "TIMEOUT"
+                else:
+                    return "TIMEOUT"
+            except Exception as e:
+                # Fallback to standard connect on error
+                pass
+        
+        # Standard socket connect (fallback or when decoys disabled)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
@@ -486,7 +530,13 @@ class AllePortsV2:
         else:
             optimal_timeout = 3.0
             
-        self.scanner = PortScanner(self.target, optimal_timeout, self.canary if canary_found else None)
+        # Initialize scanner with decoy support
+        self.scanner = PortScanner(
+            self.target, 
+            optimal_timeout, 
+            self.canary if canary_found else None,
+            self.use_decoys  # CRITICAL: Pass decoy flag to scanner
+        )
         
         # Generate port list
         ports = list(range(self.port_range[0], self.port_range[1] + 1))
